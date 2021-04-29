@@ -36,6 +36,7 @@ import org.apache.kafka.common.utils.MockTime;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.streams.errors.StreamsUncaughtExceptionHandler;
 import org.apache.kafka.streams.errors.TopologyException;
+import org.apache.kafka.streams.errors.UnknownStateStoreException;
 import org.apache.kafka.streams.internals.metrics.ClientMetrics;
 import org.apache.kafka.streams.kstream.Materialized;
 import org.apache.kafka.streams.processor.StateRestoreListener;
@@ -91,6 +92,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
+import static org.apache.kafka.streams.state.QueryableStoreTypes.keyValueStore;
 import static org.apache.kafka.streams.integration.utils.IntegrationTestUtils.safeUniqueTestName;
 import static org.easymock.EasyMock.anyInt;
 import static org.easymock.EasyMock.anyLong;
@@ -232,8 +234,8 @@ public class KafkaStreamsTest {
         EasyMock.expect(StreamThread.processingMode(anyObject(StreamsConfig.class))).andReturn(StreamThread.ProcessingMode.AT_LEAST_ONCE).anyTimes();
         EasyMock.expect(streamThreadOne.getId()).andReturn(0L).anyTimes();
         EasyMock.expect(streamThreadTwo.getId()).andReturn(1L).anyTimes();
-        prepareStreamThread(streamThreadOne, true);
-        prepareStreamThread(streamThreadTwo, false);
+        prepareStreamThread(streamThreadOne, 1, true);
+        prepareStreamThread(streamThreadTwo, 2, false);
 
         // setup global threads
         final AtomicReference<GlobalStreamThread.State> globalThreadState = new AtomicReference<>(GlobalStreamThread.State.CREATED);
@@ -293,7 +295,7 @@ public class KafkaStreamsTest {
         );
     }
 
-    private void prepareStreamThread(final StreamThread thread, final boolean terminable) throws Exception {
+    private void prepareStreamThread(final StreamThread thread, final int threadId, final boolean terminable) throws Exception {
         final AtomicReference<StreamThread.State> state = new AtomicReference<>(StreamThread.State.CREATED);
         EasyMock.expect(thread.state()).andAnswer(state::get).anyTimes();
 
@@ -319,8 +321,9 @@ public class KafkaStreamsTest {
                 StreamThread.State.PARTITIONS_ASSIGNED);
             return null;
         }).anyTimes();
+        EasyMock.expect(thread.getGroupInstanceID()).andStubReturn(Optional.empty());
         EasyMock.expect(thread.threadMetadata()).andReturn(new ThreadMetadata(
-                "newThead",
+                "processId-StreamThread-" + threadId,
                 "DEAD",
                 "",
                 "",
@@ -330,13 +333,13 @@ public class KafkaStreamsTest {
                 Collections.emptySet()
             )
         ).anyTimes();
-        EasyMock.expect(thread.threadMetadata()).andStubReturn(threadMetadata);
-        thread.waitOnThreadState(StreamThread.State.DEAD);
-        EasyMock.expectLastCall().anyTimes();
+        EasyMock.expect(thread.waitOnThreadState(EasyMock.isA(StreamThread.State.class), anyLong())).andStubReturn(true);
         EasyMock.expect(thread.isAlive()).andReturn(true).times(0, 1);
         thread.resizeCache(EasyMock.anyLong());
         EasyMock.expectLastCall().anyTimes();
-        EasyMock.expect(thread.getName()).andStubReturn("newThread");
+        thread.requestLeaveGroupDuringShutdown();
+        EasyMock.expectLastCall().anyTimes();
+        EasyMock.expect(thread.getName()).andStubReturn("processId-StreamThread-" + threadId);
         thread.shutdown();
         EasyMock.expectLastCall().andAnswer(() -> {
             supplier.consumer.close();
@@ -563,7 +566,7 @@ public class KafkaStreamsTest {
         streams.start();
         final int oldSize = streams.threads.size();
         TestUtils.waitForCondition(() -> streams.state() == KafkaStreams.State.RUNNING, 15L, "wait until running");
-        assertThat(streams.addStreamThread(), equalTo(Optional.of("newThread")));
+        assertThat(streams.addStreamThread(), equalTo(Optional.of("processId-StreamThread-" + 2)));
         assertThat(streams.threads.size(), equalTo(oldSize + 1));
     }
 
@@ -612,7 +615,7 @@ public class KafkaStreamsTest {
         final int oldSize = streams.threads.size();
         TestUtils.waitForCondition(() -> streams.state() == KafkaStreams.State.RUNNING, 15L,
             "Kafka Streams client did not reach state RUNNING");
-        assertThat(streams.removeStreamThread(), equalTo(Optional.of("newThread")));
+        assertThat(streams.removeStreamThread(), equalTo(Optional.of("processId-StreamThread-" + 1)));
         assertThat(streams.threads.size(), equalTo(oldSize - 1));
     }
 
@@ -742,6 +745,14 @@ public class KafkaStreamsTest {
     public void shouldNotGetQueryMetadataWithPartitionerWhenNotRunningOrRebalancing() {
         final KafkaStreams streams = new KafkaStreams(getBuilderWithSource().build(), props, supplier, time);
         assertThrows(IllegalStateException.class, () -> streams.queryMetadataForKey("store", "key", (topic, key, value, numPartitions) -> 0));
+    }
+
+    @Test
+    public void shouldThrowUnknownStateStoreExceptionWhenStoreNotExist() {
+        try (final KafkaStreams streams = new KafkaStreams(getBuilderWithSource().build(), props, supplier, time)) {
+            streams.start();
+            assertThrows(UnknownStateStoreException.class, () -> streams.store(StoreQueryParameters.fromNameAndType("unknown-store", keyValueStore())));
+        }
     }
 
     @Test
@@ -879,6 +890,8 @@ public class KafkaStreamsTest {
             anyObject(Time.class),
             EasyMock.eq(true)
         ).andReturn(stateDirectory);
+        EasyMock.expect(stateDirectory.initializeProcessId()).andReturn(UUID.randomUUID());
+        stateDirectory.close();
         PowerMock.replayAll(Executors.class, cleanupSchedule, stateDirectory);
 
         props.setProperty(StreamsConfig.STATE_CLEANUP_DELAY_MS_CONFIG, "1");
@@ -1048,6 +1061,7 @@ public class KafkaStreamsTest {
             anyObject(Time.class),
             EasyMock.eq(shouldFilesExist)
         ).andReturn(stateDirectory);
+        EasyMock.expect(stateDirectory.initializeProcessId()).andReturn(UUID.randomUUID());
 
         PowerMock.replayAll();
 
