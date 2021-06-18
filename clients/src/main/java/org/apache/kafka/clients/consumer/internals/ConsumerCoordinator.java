@@ -306,17 +306,23 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
      * @param timer Timer bounding how long this method can block
      * @return true iff the operation succeeded
      */
+    // note: 协调者事件轮询。这个确保协调者是确定的，并且消费者已经加入消费者组（如果使用消费组管理）。这个也处理偏移量自动提交。
     public boolean poll(Timer timer) {
+        // note: 调用已经完成位移提交的回调
         invokeCompletedOffsetCommitCallbacks();
 
+        // note: 订阅模式
         if (subscriptions.partitionsAutoAssigned()) {
             // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
             // group proactively due to application inactivity even if (say) the coordinator cannot be found.
+            // note: 即使协调者不确定也要发送心跳请求
             pollHeartbeat(timer.currentTimeMs());
+            // note: 获取组协调者地址并建立链接
             if (coordinatorUnknown() && !ensureCoordinatorReady(timer)) {
                 return false;
             }
 
+            // note: 重新加入消费者组
             if (rejoinNeededOrPending()) {
                 // due to a race condition between the initial metadata fetch and the initial rebalance,
                 // we need to ensure that the metadata is fresh before joining initially. This ensures
